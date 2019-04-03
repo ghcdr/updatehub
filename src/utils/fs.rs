@@ -3,15 +3,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::update_package::object::definitions::{target_permissions::Id, Filesystem};
-use libc;
-use std::{
-    io,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
-    path::Path,
-    process::Command,
-};
+// use easy_process;
+use failure::ensure;
+use nix::unistd::{Gid, Uid};
+use std::{io, path::Path, process::Command};
+use sys_mount::{Mount, Unmount, UnmountDrop};
 
-pub(crate) fn format(target: &Path, fs: Filesystem, options: &Option<String>) -> io::Result<()> {
+pub(crate) fn format(
+    target: &Path,
+    fs: Filesystem,
+    options: &Option<String>,
+) -> Result<(), failure::Error> {
     let target = target.display();
     let options = options.clone().unwrap_or_else(|| "".to_string());
 
@@ -27,9 +29,17 @@ pub(crate) fn format(target: &Path, fs: Filesystem, options: &Option<String>) ->
         }
     };
 
-    // FIXME: use easyprocess here
-    let cmd: Vec<&str> = cmd.split(' ').collect();
-    Command::new(cmd[0]).args(&cmd[1..]).output()?;
+    // let output = easy_process::run(&cmd.as_str())?;
+    let cmd: Vec<&str> = cmd.split(' ').filter(|s| !s.is_empty()).collect();
+    let output = Command::new(cmd[0]).args(&cmd[1..]).output()?;
+    ensure!(
+        output.status.success(),
+        format!("Format command failed with code: {:#?}", output)
+    );
+    // ensure!(
+    //     output.stderr.is_empty(),
+    //     format!("Format command filed: {:?}", output)
+    // );
 
     Ok(())
 }
@@ -39,56 +49,30 @@ pub(crate) fn mount(
     dest: &Path,
     fs: Filesystem,
     options: &str,
-) -> io::Result<sys_mount::Mount> {
-    sys_mount::Mount::new(
+) -> io::Result<UnmountDrop<Mount>> {
+    Ok(Mount::new(
         source,
         dest,
-        sys_mount::FilesystemType::Manual(&format!("{}", fs)),
+        format!("{}", fs).as_str(),
         sys_mount::MountFlags::empty(),
         Some(options),
-    )
+    )?
+    .into_unmount_drop(sys_mount::UnmountFlags::DETACH))
 }
 
-pub(crate) fn umount(mount_path: &Path) -> io::Result<()> {
-    sys_mount::unmount(mount_path, sys_mount::UnmountFlags::empty())
-}
-
-pub(crate) fn chmod(file: &Path, mode: u32) -> io::Result<()> {
-    file.metadata()?.permissions().set_mode(mode);
+pub(crate) fn chmod(path: &Path, mode: u32) -> Result<(), failure::Error> {
+    nix::sys::stat::fchmodat(
+        None,
+        path,
+        nix::sys::stat::Mode::from_bits(mode).unwrap(),
+        nix::sys::stat::FchmodatFlags::FollowSymlink,
+    )?;
     Ok(())
 }
 
-pub(crate) fn chown(
-    file_path: &Path,
-    file_uid: &Option<Id>,
-    file_gid: &Option<Id>,
-) -> io::Result<()> {
-    let ret = unsafe {
-        let uid = file_uid
-            .as_ref()
-            .map(|id| match id {
-                Id::Name(s) => (*libc::getpwnam(s.as_str().as_ptr() as *const i8)).pw_uid,
-                Id::Number(n) => *n as libc::uid_t,
-            })
-            .unwrap_or(-1 as i32 as libc::uid_t);
-        let gid = file_gid
-            .as_ref()
-            .map(|id| match id {
-                Id::Name(s) => (*libc::getgrnam(s.as_str().as_ptr() as *const i8)).gr_gid,
-                Id::Number(n) => *n as libc::gid_t,
-            })
-            .unwrap_or(-1 as i32 as libc::gid_t);
+pub(crate) fn chown(path: &Path, uid: &Option<Id>, gid: &Option<Id>) -> nix::Result<()> {
+    let uid = uid.as_ref().map(|id| Uid::from_raw(id.as_uid_t()));
+    let gid = gid.as_ref().map(|id| Gid::from_raw(id.as_gid_t()));
 
-        libc::lchown(
-            file_path.as_os_str().as_bytes().as_ptr() as *const i8,
-            uid,
-            gid,
-        )
-    };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    nix::unistd::chown(path, uid, gid)
 }

@@ -25,7 +25,7 @@ slog-scope = "4"
 slog-term = "2"
 sys-mount = "1"
 lazy_static = "1"
-libc = "0.2"
+nix = "0.13"
 parse_duration = "1"
 rand = "0.6"
 reqwest = "0.9"
@@ -47,5 +47,6 @@ panic = 'abort'
 git-version = "0.2"
 
 [dev-dependencies]
+loopdev = "0.2"
 mockito = "0.17"
 pretty_assertions = "0.6"

@@ -24,6 +24,28 @@ pub enum Id {
     Number(u32),
 }
 
+impl Id {
+    pub fn as_uid_t(&self) -> u32 {
+        match self {
+            Id::Name(s) => {
+                let s = std::ffi::CString::new(s.as_str());
+                unsafe { *nix::libc::getpwnam(s.unwrap().as_ptr()) }.pw_uid
+            }
+            Id::Number(n) => *n,
+        }
+    }
+
+    pub fn as_gid_t(&self) -> u32 {
+        match self {
+            Id::Name(s) => {
+                let s = std::ffi::CString::new(s.as_str());
+                unsafe { *nix::libc::getgrnam(s.unwrap().as_ptr()) }.gr_gid
+            }
+            Id::Number(n) => *n,
+        }
+    }
+}
+
 #[test]
 fn deserialize() {
     use pretty_assertions::assert_eq;

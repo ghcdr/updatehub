@@ -2,8 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{definitions, ObjectType};
+use super::{definitions, ObjectInstaller, ObjectType};
+use crate::utils;
+use failure::bail;
 use serde::Deserialize;
+use slog::slog_info;
+use slog_scope::info;
+use std::{fs, io, os::unix::fs::PermissionsExt, path::PathBuf};
+use tempfile;
 
 #[derive(Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -30,6 +36,71 @@ pub(crate) struct Copy {
 }
 
 impl_object_type!(Copy);
+
+impl ObjectInstaller for Copy {
+    fn check_requirements(&self) -> Result<(), failure::Error> {
+        info!("'copy' handle checking requirements");
+        if let definitions::TargetType::Device(_) = self.target_type.valid()? {
+            return Ok(());
+        }
+
+        bail!("Unexpected target type, expected some device.")
+    }
+
+    fn install(&self, download_dir: PathBuf) -> Result<(), failure::Error> {
+        info!("'copy' handler Install");
+
+        let device: &PathBuf = match self.target_type {
+            definitions::TargetType::Device(ref p) => p,
+            _ => unreachable!("Device should be secured by check_requirements"),
+        };
+        let workdir = tempfile::tempdir()?;
+        let workdir = workdir.path();
+        let fs = self.filesystem;
+        let mount_options = &self.mount_options;
+        let format_options = &self.target_format.format_options;
+        let chunk_size = definitions::ChunkSize::default().0;
+
+        let dest = workdir.join(&self.target_path);
+        let source = download_dir.join(self.sha256sum());
+
+        if self.target_format.format {
+            utils::fs::format(device, fs, &format_options)?;
+        }
+
+        utils::fs::mount(device, &workdir, fs, mount_options)?;
+
+        let mut input = io::BufReader::with_capacity(chunk_size, fs::File::open(source)?);
+        let mut output = io::BufWriter::with_capacity(
+            chunk_size,
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&dest)?,
+        );
+
+        let orig_mode = dest.metadata()?.permissions().mode();
+        dest.metadata()?.permissions().set_mode(0o666);
+        io::copy(&mut input, &mut output)?;
+        dest.metadata()?.permissions().set_mode(orig_mode);
+
+        self.target_permissions
+            .target_mode
+            .map(|mode| utils::fs::chmod(&dest, mode));
+
+        utils::fs::chown(
+            &dest,
+            &self.target_permissions.target_uid,
+            &self.target_permissions.target_gid,
+        )?;
+
+        utils::fs::umount(&workdir)?;
+
+        Ok(())
+    }
+}
 
 #[test]
 fn deserialize() {
@@ -68,3 +139,9 @@ fn deserialize() {
         .unwrap()
     );
 }
+
+// FIXME: missing tests:
+// - copy over existing file
+// - copy a new file
+// - change uid / gid
+// - change mode

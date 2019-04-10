@@ -34,7 +34,7 @@ pub(crate) fn format(
     Ok(())
 }
 
-pub(crate) fn mount_and_run<F>(
+pub(crate) fn mount_map<F>(
     source: &Path,
     fs: Filesystem,
     options: &str,
@@ -45,7 +45,11 @@ where
 {
     let tmpdir = tempfile::tempdir()?;
     let tmpdir = tmpdir.path();
+
+    // We need to keep a guard otherwise it is dropped before the
+    // closure is run.
     let _guard = mount(source, &tmpdir, fs, options)?;
+
     f(tmpdir)
 }
 

@@ -68,7 +68,7 @@ impl ObjectInstaller for Copy {
             utils::fs::format(device, filesystem, &format_options)?;
         }
 
-        utils::fs::mount_and_run(device, filesystem, mount_options, |path| {
+        utils::fs::mount_map(device, filesystem, mount_options, |path| {
             let dest = path.join(&self.target_path);
             let source = download_dir.join(self.sha256sum());
             let mut input = io::BufReader::with_capacity(chunk_size, fs::File::open(source)?);
@@ -121,26 +121,27 @@ mod tests {
     const ORIGINAL_BYTE: u8 = 0xA;
     const FILE_SIZE: usize = 2048;
 
-    fn fake_copy_object<F>(
+    fn exec_test_with_copy<F>(
         mut f: F,
         original_permissions: Option<definitions::TargetPermissions>,
     ) -> Result<(), failure::Error>
     where
         F: FnMut(&mut Copy),
     {
-        // Setup device
-        let loopdev = loopdev::LoopControl::open()?.next_free()?;
+        // Generate a sparse file for the faked device use
         let mut image = tempfile::NamedTempFile::new()?;
         image.seek(SeekFrom::Start(1024 * 1024 + FILE_SIZE as u64))?;
         image.write_all(&[0])?;
-        loopdev.attach_file(image.path())?;
-        utils::fs::format(
-            &loopdev.path().unwrap(),
-            definitions::Filesystem::Ext4,
-            &None,
-        )?;
 
-        // Setup source file
+        // Setup faked device
+        let loopdev = loopdev::LoopControl::open()?.next_free()?;
+        let device = loopdev.path().unwrap();
+        loopdev.attach_file(image.path())?;
+
+        // Format the faked device
+        utils::fs::format(&device, definitions::Filesystem::Ext4, &None)?;
+
+        // Generate the source file
         let download_dir = tempfile::tempdir()?;
         let mut source = tempfile::NamedTempFile::new_in(download_dir.path())?;
         source.write_all(
@@ -148,28 +149,25 @@ mod tests {
                 .take(FILE_SIZE)
                 .collect::<Vec<_>>(),
         )?;
-        source.seek(SeekFrom::Start(0))?;
 
-        // Setup some original file in the device
+        // When needed, create a file inside the mounted device
         if let Some(perm) = original_permissions {
-            utils::fs::mount_and_run(
-                &loopdev.path().unwrap(),
-                definitions::Filesystem::Ext4,
-                &"",
-                |path| {
-                    let orig_file = path.join(&"original_file");
-                    fs::File::create(&orig_file)?.write_all(
-                        &iter::repeat(ORIGINAL_BYTE)
-                            .take(FILE_SIZE)
-                            .collect::<Vec<_>>(),
-                    )?;
-                    if let Some(mode) = perm.target_mode {
-                        utils::fs::chmod(&orig_file, mode)?;
-                    }
-                    utils::fs::chown(&orig_file, &perm.target_uid, &perm.target_gid)?;
-                    Ok(())
-                },
-            )?;
+            utils::fs::mount_map(&device, definitions::Filesystem::Ext4, &"", |path| {
+                let file = path.join(&"original_file");
+                fs::File::create(&file)?.write_all(
+                    &iter::repeat(ORIGINAL_BYTE)
+                        .take(FILE_SIZE)
+                        .collect::<Vec<_>>(),
+                )?;
+
+                if let Some(mode) = perm.target_mode {
+                    utils::fs::chmod(&file, mode)?;
+                }
+
+                utils::fs::chown(&file, &perm.target_uid, &perm.target_gid)?;
+
+                Ok(())
+            })?;
         }
 
         // Generate base copy object
@@ -178,7 +176,7 @@ mod tests {
             filesystem: definitions::Filesystem::Ext4,
             size: FILE_SIZE as u64,
             sha256sum: source.path().to_string_lossy().to_string(),
-            target_type: definitions::TargetType::Device(loopdev.path().unwrap()),
+            target_type: definitions::TargetType::Device(device.clone()),
             target_path: "original_file".to_string(),
             install_if_different: None,
             target_permissions: definitions::TargetPermissions::default(),
@@ -187,6 +185,7 @@ mod tests {
             target_format: definitions::TargetFormat::default(),
             mount_options: String::default(),
         };
+
         // Change copy object to be used on current test
         f(&mut obj);
 
@@ -196,8 +195,8 @@ mod tests {
         obj.install(download_dir.path().to_path_buf())?;
 
         // Validade File
-        utils::fs::mount_and_run(
-            &loopdev.path().unwrap(),
+        utils::fs::mount_map(
+            &device,
             obj.filesystem.clone(),
             &obj.mount_options.clone(),
             |path| {
@@ -206,6 +205,7 @@ mod tests {
                 let source = download_dir.path().join(&obj.sha256sum);
                 let mut rd1 = io::BufReader::with_capacity(chunk_size, fs::File::open(&source)?);
                 let mut rd2 = io::BufReader::with_capacity(chunk_size, fs::File::open(&dest)?);
+
                 loop {
                     let buf1 = rd1.fill_buf()?;
                     let len1 = buf1.len();
@@ -219,23 +219,28 @@ mod tests {
                     rd1.consume(len1);
                     rd2.consume(len2);
                 }
+
                 let metadata = dest.metadata()?;
                 obj.target_permissions.target_mode.map(|mode| {
                     assert_eq!(mode, metadata.mode() % 0o1000);
                 });
+
                 obj.target_permissions.target_uid.map(|uid| {
                     let uid = uid.as_u32();
-                    assert_eq!(uid, metadata.uid() % 0o1000);
+                    assert_eq!(uid, metadata.uid());
                 });
+
                 obj.target_permissions.target_gid.map(|gid| {
                     let gid = gid.as_u32();
-                    assert_eq!(gid, metadata.gid() % 0o1000);
+                    assert_eq!(gid, metadata.gid());
                 });
+
                 Ok(())
             },
         )?;
 
         loopdev.detach()?;
+
         Ok(())
     }
 
@@ -243,14 +248,14 @@ mod tests {
     #[ignore]
     #[serial]
     fn copy_over_formated_partion() {
-        fake_copy_object(|obj| obj.target_format.format = true, None).unwrap();
+        exec_test_with_copy(|obj| obj.target_format.format = true, None).unwrap();
     }
 
     #[test]
     #[ignore]
     #[serial]
     fn copy_over_existing_file() {
-        fake_copy_object(
+        exec_test_with_copy(
             |_| (),
             Some(definitions::TargetPermissions {
                 target_mode: Some(0o666),
@@ -265,7 +270,7 @@ mod tests {
     #[ignore]
     #[serial]
     fn copy_change_uid() {
-        fake_copy_object(
+        exec_test_with_copy(
             |obj| {
                 obj.target_permissions.target_uid =
                     Some(definitions::target_permissions::Uid::Number(0))
@@ -279,7 +284,7 @@ mod tests {
     #[ignore]
     #[serial]
     fn copy_change_gid() {
-        fake_copy_object(
+        exec_test_with_copy(
             |obj| {
                 obj.target_permissions.target_gid =
                     Some(definitions::target_permissions::Gid::Number(0))
@@ -297,7 +302,7 @@ mod tests {
     #[ignore]
     #[serial]
     fn copy_change_mode() {
-        fake_copy_object(
+        exec_test_with_copy(
             |obj| obj.target_permissions.target_mode = Some(0o444),
             Some(definitions::TargetPermissions {
                 target_mode: Some(0o666),

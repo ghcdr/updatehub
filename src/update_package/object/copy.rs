@@ -107,15 +107,20 @@ impl ObjectInstaller for Copy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lazy_static::lazy_static;
     use pretty_assertions::assert_eq;
     use serde_json::json;
-    use serial_test_derive::serial;
     use std::{
         io::{BufRead, Seek, SeekFrom, Write},
         iter,
         os::unix::fs::MetadataExt,
         path::PathBuf,
+        sync::{Arc, Mutex},
     };
+
+    lazy_static! {
+        static ref SERIALIZE: Arc<Mutex<()>> = Arc::new(Mutex::default());
+    }
 
     const DEFAULT_BYTE: u8 = 0xF;
     const ORIGINAL_BYTE: u8 = 0xA;
@@ -134,9 +139,14 @@ mod tests {
         image.write_all(&[0])?;
 
         // Setup faked device
-        let loopdev = loopdev::LoopControl::open()?.next_free()?;
-        let device = loopdev.path().unwrap();
-        loopdev.attach_file(image.path())?;
+        let (loopdev, device) = {
+            let mutex = SERIALIZE.clone();
+            let _guard = mutex.lock().unwrap();
+            let loopdev = loopdev::LoopControl::open()?.next_free()?;
+            let device = loopdev.path().unwrap();
+            loopdev.attach_file(image.path())?;
+            (loopdev, device)
+        };
 
         // Format the faked device
         utils::fs::format(&device, definitions::Filesystem::Ext4, &None)?;
@@ -197,7 +207,7 @@ mod tests {
         // Validade File
         utils::fs::mount_map(
             &device,
-            obj.filesystem.clone(),
+            obj.filesystem,
             &obj.mount_options.clone(),
             |path| {
                 let chunk_size = definitions::ChunkSize::default().0;
@@ -221,19 +231,19 @@ mod tests {
                 }
 
                 let metadata = dest.metadata()?;
-                obj.target_permissions.target_mode.map(|mode| {
+                if let Some(mode) = obj.target_permissions.target_mode {
                     assert_eq!(mode, metadata.mode() % 0o1000);
-                });
+                };
 
-                obj.target_permissions.target_uid.map(|uid| {
+                if let Some(uid) = obj.target_permissions.target_uid {
                     let uid = uid.as_u32();
                     assert_eq!(uid, metadata.uid());
-                });
+                };
 
-                obj.target_permissions.target_gid.map(|gid| {
+                if let Some(gid) = obj.target_permissions.target_gid {
                     let gid = gid.as_u32();
                     assert_eq!(gid, metadata.gid());
-                });
+                };
 
                 Ok(())
             },
@@ -246,14 +256,12 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[serial]
     fn copy_over_formated_partion() {
         exec_test_with_copy(|obj| obj.target_format.format = true, None).unwrap();
     }
 
     #[test]
     #[ignore]
-    #[serial]
     fn copy_over_existing_file() {
         exec_test_with_copy(
             |_| (),
@@ -268,7 +276,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[serial]
     fn copy_change_uid() {
         exec_test_with_copy(
             |obj| {
@@ -282,7 +289,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[serial]
     fn copy_change_gid() {
         exec_test_with_copy(
             |obj| {
@@ -300,7 +306,6 @@ mod tests {
 
     #[test]
     #[ignore]
-    #[serial]
     fn copy_change_mode() {
         exec_test_with_copy(
             |obj| obj.target_permissions.target_mode = Some(0o444),

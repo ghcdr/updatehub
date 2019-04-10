@@ -67,12 +67,14 @@ pub(crate) fn chmod(path: &Path, mode: u32) -> Result<(), failure::Error> {
         nix::sys::stat::Mode::from_bits(mode).unwrap(),
         nix::sys::stat::FchmodatFlags::FollowSymlink,
     )?;
+
     Ok(())
 }
 
 pub(crate) fn chown(path: &Path, uid: &Option<Id>, gid: &Option<Id>) -> nix::Result<()> {
-    let uid = uid.as_ref().map(|id| Uid::from_raw(id.as_uid_t()));
-    let gid = gid.as_ref().map(|id| Gid::from_raw(id.as_gid_t()));
-
-    nix::unistd::chown(path, uid, gid)
+    nix::unistd::chown(
+        path,
+        uid.as_ref().map(|id| Uid::from_raw(id.as_uid_t())),
+        gid.as_ref().map(|id| Gid::from_raw(id.as_gid_t())),
+    )
 }

@@ -55,25 +55,27 @@ impl ObjectInstaller for Copy {
     fn install(&self, download_dir: PathBuf) -> Result<(), failure::Error> {
         info!("'copy' handler Install");
 
-        let device: &PathBuf = match self.target_type {
+        let tmpdir = tempfile::tempdir()?;
+        let tmpdir = tmpdir.path();
+
+        let device = match self.target_type {
             definitions::TargetType::Device(ref p) => p,
             _ => unreachable!("Device should be secured by check_requirements"),
         };
-        let guard_workdir = tempfile::tempdir()?;
-        let workdir = guard_workdir.path();
-        let fs = self.filesystem;
+
+        let filesystem = self.filesystem;
         let mount_options = &self.mount_options;
         let format_options = &self.target_format.format_options;
         let chunk_size = definitions::ChunkSize::default().0;
 
-        let dest = workdir.join(&self.target_path);
+        let dest = tmpdir.join(&self.target_path);
         let source = download_dir.join(self.sha256sum());
 
         if self.target_format.format {
-            utils::fs::format(device, fs, &format_options)?;
+            utils::fs::format(device, filesystem, &format_options)?;
         }
 
-        let _guard_mount = utils::fs::mount(device, &workdir, fs, mount_options)?;
+        let _guard_mount = utils::fs::mount(device, &tmpdir, filesystem, mount_options)?;
 
         let mut input = io::BufReader::with_capacity(chunk_size, fs::File::open(source)?);
         let mut output = io::BufWriter::with_capacity(
@@ -110,7 +112,6 @@ impl ObjectInstaller for Copy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loopdev::LoopControl;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use serial_test_derive::serial;
@@ -120,7 +121,6 @@ mod tests {
         os::unix::fs::MetadataExt,
         path::PathBuf,
     };
-    use tempfile::{tempdir, NamedTempFile};
 
     const DEFAULT_BYTE: u8 = 0xF;
     const ORIGINAL_BYTE: u8 = 0xA;
@@ -134,21 +134,29 @@ mod tests {
         F: FnMut(&mut Copy),
     {
         // Setup device
-        let dev = LoopControl::open()?.next_free()?;
-        let mut image = NamedTempFile::new()?;
+        let loopdev = loopdev::LoopControl::open()?.next_free()?;
+        let mut image = tempfile::NamedTempFile::new()?;
+
         // FIXME: use seek for image file
         image.write_all(
             &iter::repeat(0)
                 .take(1024 * 1024 + FILE_SIZE)
                 .collect::<Vec<_>>(),
         )?;
-        dev.attach_file(image.path())?;
-        let mount_dir = tempdir()?;
-        utils::fs::format(&dev.path().unwrap(), definitions::Filesystem::Ext4, &None)?;
+        loopdev.attach_file(image.path())?;
+
+        let tmpdir = tempfile::tempdir()?;
+        let tmpdir = tmpdir.path().to_path_buf();
+
+        utils::fs::format(
+            &loopdev.path().unwrap(),
+            definitions::Filesystem::Ext4,
+            &None,
+        )?;
 
         // Setup source file
-        let download_dir = tempdir()?;
-        let mut source = NamedTempFile::new_in(download_dir.path())?;
+        let download_dir = tempfile::tempdir()?;
+        let mut source = tempfile::NamedTempFile::new_in(download_dir.path())?;
         source.write_all(
             &iter::repeat(DEFAULT_BYTE)
                 .take(FILE_SIZE)
@@ -159,31 +167,24 @@ mod tests {
         // Setup some original file in the device
         if let Some(perm) = original_permissions {
             let _mount_guard = utils::fs::mount(
-                &dev.path().unwrap(),
-                &mount_dir.path(),
+                &loopdev.path().unwrap(),
+                &tmpdir,
                 definitions::Filesystem::Ext4,
                 &"",
             )?;
-            let mut ofile_path = mount_dir.path().to_path_buf();
-            ofile_path.push(&"original_file");
-            let mut f = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&ofile_path)?;
-            f.write_all(
+
+            let orig_file = tmpdir.join(&"original_file");
+            fs::File::create(&orig_file)?.write_all(
                 &iter::repeat(ORIGINAL_BYTE)
                     .take(FILE_SIZE)
                     .collect::<Vec<_>>(),
             )?;
-            f.flush()?;
 
             if let Some(mode) = perm.target_mode {
-                utils::fs::chmod(&ofile_path, mode)?;
+                utils::fs::chmod(&orig_file, mode)?;
             }
 
-            utils::fs::chown(&ofile_path, &perm.target_uid, &perm.target_gid)?;
+            utils::fs::chown(&orig_file, &perm.target_uid, &perm.target_gid)?;
         }
 
         let mut obj = Copy {
@@ -191,7 +192,7 @@ mod tests {
             filesystem: definitions::Filesystem::Ext4,
             size: FILE_SIZE as u64,
             sha256sum: source.path().to_string_lossy().to_string(),
-            target_type: definitions::TargetType::Device(dev.path().unwrap()),
+            target_type: definitions::TargetType::Device(loopdev.path().unwrap()),
             target_path: "original_file".to_string(),
 
             install_if_different: None,
@@ -201,6 +202,7 @@ mod tests {
             target_format: definitions::TargetFormat::default(),
             mount_options: String::default(),
         };
+
         f(&mut obj);
 
         obj.check_requirements()?;
@@ -212,7 +214,7 @@ mod tests {
         let workdir = guard_workdir.path();
         let chunk_size = definitions::ChunkSize::default().0;
         let _guard_mount = utils::fs::mount(
-            &dev.path().unwrap(),
+            &loopdev.path().unwrap(),
             &workdir,
             obj.filesystem,
             &String::default(),
@@ -247,13 +249,13 @@ mod tests {
             assert_eq!(gid, metadata.gid() % 0o1000);
         }
 
-        dev.detach()?;
+        loopdev.detach()?;
         Ok(())
     }
 
     #[test]
-    #[ignore]
     #[serial]
+    #[ignore]
     fn copy_over_formated_partion() {
         fake_copy_object(|obj| obj.target_format.format = true, None).unwrap();
     }

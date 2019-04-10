@@ -113,6 +113,7 @@ mod tests {
     use loopdev::LoopControl;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use serial_test_derive::serial;
     use std::{
         io::{BufRead, Seek, SeekFrom, Write},
         iter,
@@ -252,12 +253,14 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[serial]
     fn copy_over_formated_partion() {
         fake_copy_object(|obj| obj.target_format.format = true, None).unwrap();
     }
 
     #[test]
     #[ignore]
+    #[serial]
     fn copy_over_existing_file() {
         fake_copy_object(
             |_| (),
@@ -272,6 +275,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[serial]
     fn copy_change_uid() {
         fake_copy_object(
             |obj| {
@@ -285,6 +289,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[serial]
     fn copy_change_gid() {
         fake_copy_object(
             |obj| {
@@ -302,6 +307,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[serial]
     fn copy_change_mode() {
         fake_copy_object(
             |obj| obj.target_permissions.target_mode = Some(0o444),

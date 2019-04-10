@@ -14,7 +14,6 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
 };
-use tempfile;
 
 #[derive(Deserialize, PartialEq, Debug)]
 #[serde(rename_all = "kebab-case")]
@@ -55,9 +54,6 @@ impl ObjectInstaller for Copy {
     fn install(&self, download_dir: PathBuf) -> Result<(), failure::Error> {
         info!("'copy' handler Install");
 
-        let tmpdir = tempfile::tempdir()?;
-        let tmpdir = tmpdir.path();
-
         let device = match self.target_type {
             definitions::TargetType::Device(ref p) => p,
             _ => unreachable!("Device should be secured by check_requirements"),
@@ -68,44 +64,43 @@ impl ObjectInstaller for Copy {
         let format_options = &self.target_format.format_options;
         let chunk_size = definitions::ChunkSize::default().0;
 
-        let dest = tmpdir.join(&self.target_path);
-        let source = download_dir.join(self.sha256sum());
-
         if self.target_format.format {
             utils::fs::format(device, filesystem, &format_options)?;
         }
 
-        let _guard_mount = utils::fs::mount(device, &tmpdir, filesystem, mount_options)?;
+        utils::fs::mount_and_run(device, filesystem, mount_options, |path| {
+            let dest = path.join(&self.target_path);
+            let source = download_dir.join(self.sha256sum());
+            let mut input = io::BufReader::with_capacity(chunk_size, fs::File::open(source)?);
+            let mut output = io::BufWriter::with_capacity(
+                chunk_size,
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&dest)?,
+            );
 
-        let mut input = io::BufReader::with_capacity(chunk_size, fs::File::open(source)?);
-        let mut output = io::BufWriter::with_capacity(
-            chunk_size,
-            fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&dest)?,
-        );
+            let metadata = dest.metadata()?;
+            let orig_mode = metadata.permissions().mode();
+            metadata.permissions().set_mode(0o100_666);
+            io::copy(&mut input, &mut output)?;
+            output.flush()?;
+            metadata.permissions().set_mode(orig_mode);
 
-        let metadata = dest.metadata()?;
-        let orig_mode = metadata.permissions().mode();
-        metadata.permissions().set_mode(0o100_666);
-        io::copy(&mut input, &mut output)?;
-        output.flush()?;
-        metadata.permissions().set_mode(orig_mode);
+            if let Some(mode) = self.target_permissions.target_mode {
+                utils::fs::chmod(&dest, mode)?;
+            }
 
-        if let Some(mode) = self.target_permissions.target_mode {
-            utils::fs::chmod(&dest, mode)?;
-        }
+            utils::fs::chown(
+                &dest,
+                &self.target_permissions.target_uid,
+                &self.target_permissions.target_gid,
+            )?;
 
-        utils::fs::chown(
-            &dest,
-            &self.target_permissions.target_uid,
-            &self.target_permissions.target_gid,
-        )?;
-
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -136,18 +131,9 @@ mod tests {
         // Setup device
         let loopdev = loopdev::LoopControl::open()?.next_free()?;
         let mut image = tempfile::NamedTempFile::new()?;
-
-        // FIXME: use seek for image file
-        image.write_all(
-            &iter::repeat(0)
-                .take(1024 * 1024 + FILE_SIZE)
-                .collect::<Vec<_>>(),
-        )?;
+        image.seek(SeekFrom::Start(1024 * 1024 + FILE_SIZE as u64))?;
+        image.write_all(&[0])?;
         loopdev.attach_file(image.path())?;
-
-        let tmpdir = tempfile::tempdir()?;
-        let tmpdir = tmpdir.path().to_path_buf();
-
         utils::fs::format(
             &loopdev.path().unwrap(),
             definitions::Filesystem::Ext4,
@@ -166,27 +152,27 @@ mod tests {
 
         // Setup some original file in the device
         if let Some(perm) = original_permissions {
-            let _mount_guard = utils::fs::mount(
+            utils::fs::mount_and_run(
                 &loopdev.path().unwrap(),
-                &tmpdir,
                 definitions::Filesystem::Ext4,
                 &"",
+                |path| {
+                    let orig_file = path.join(&"original_file");
+                    fs::File::create(&orig_file)?.write_all(
+                        &iter::repeat(ORIGINAL_BYTE)
+                            .take(FILE_SIZE)
+                            .collect::<Vec<_>>(),
+                    )?;
+                    if let Some(mode) = perm.target_mode {
+                        utils::fs::chmod(&orig_file, mode)?;
+                    }
+                    utils::fs::chown(&orig_file, &perm.target_uid, &perm.target_gid)?;
+                    Ok(())
+                },
             )?;
-
-            let orig_file = tmpdir.join(&"original_file");
-            fs::File::create(&orig_file)?.write_all(
-                &iter::repeat(ORIGINAL_BYTE)
-                    .take(FILE_SIZE)
-                    .collect::<Vec<_>>(),
-            )?;
-
-            if let Some(mode) = perm.target_mode {
-                utils::fs::chmod(&orig_file, mode)?;
-            }
-
-            utils::fs::chown(&orig_file, &perm.target_uid, &perm.target_gid)?;
         }
 
+        // Generate base copy object
         let mut obj = Copy {
             filename: "".to_string(),
             filesystem: definitions::Filesystem::Ext4,
@@ -194,7 +180,6 @@ mod tests {
             sha256sum: source.path().to_string_lossy().to_string(),
             target_type: definitions::TargetType::Device(loopdev.path().unwrap()),
             target_path: "original_file".to_string(),
-
             install_if_different: None,
             target_permissions: definitions::TargetPermissions::default(),
             compressed: false,
@@ -202,60 +187,61 @@ mod tests {
             target_format: definitions::TargetFormat::default(),
             mount_options: String::default(),
         };
-
+        // Change copy object to be used on current test
         f(&mut obj);
 
+        // Peform Install
         obj.check_requirements()?;
         obj.setup()?;
         obj.install(download_dir.path().to_path_buf())?;
 
         // Validade File
-        let guard_workdir = tempfile::tempdir()?;
-        let workdir = guard_workdir.path();
-        let chunk_size = definitions::ChunkSize::default().0;
-        let _guard_mount = utils::fs::mount(
+        utils::fs::mount_and_run(
             &loopdev.path().unwrap(),
-            &workdir,
-            obj.filesystem,
-            &String::default(),
+            obj.filesystem.clone(),
+            &obj.mount_options.clone(),
+            |path| {
+                let chunk_size = definitions::ChunkSize::default().0;
+                let dest = path.join(&obj.target_path);
+                let source = download_dir.path().join(&obj.sha256sum);
+                let mut rd1 = io::BufReader::with_capacity(chunk_size, fs::File::open(&source)?);
+                let mut rd2 = io::BufReader::with_capacity(chunk_size, fs::File::open(&dest)?);
+                loop {
+                    let buf1 = rd1.fill_buf()?;
+                    let len1 = buf1.len();
+                    let buf2 = rd2.fill_buf()?;
+                    let len2 = buf2.len();
+                    // Stop comparing when both the files reach EOF
+                    if len1 == 0 && len2 == 0 {
+                        break;
+                    }
+                    assert_eq!(buf1, buf2);
+                    rd1.consume(len1);
+                    rd2.consume(len2);
+                }
+                let metadata = dest.metadata()?;
+                obj.target_permissions.target_mode.map(|mode| {
+                    assert_eq!(mode, metadata.mode() % 0o1000);
+                });
+                obj.target_permissions.target_uid.map(|uid| {
+                    let uid = uid.as_u32();
+                    assert_eq!(uid, metadata.uid() % 0o1000);
+                });
+                obj.target_permissions.target_gid.map(|gid| {
+                    let gid = gid.as_u32();
+                    assert_eq!(gid, metadata.gid() % 0o1000);
+                });
+                Ok(())
+            },
         )?;
-        let dest = workdir.join(&obj.target_path);
-        let source = download_dir.path().to_path_buf().join(obj.sha256sum);
-        let mut f1_reader = io::BufReader::with_capacity(chunk_size, fs::File::open(&source)?);
-        let mut f2_reader = io::BufReader::with_capacity(chunk_size, fs::File::open(&dest)?);
-        loop {
-            let buf1 = f1_reader.fill_buf()?;
-            let len1 = buf1.len();
-            let buf2 = f2_reader.fill_buf()?;
-            let len2 = buf2.len();
-            // Stop comparing when both the files reach EOF
-            if len1 == 0 && len2 == 0 {
-                break;
-            }
-            assert_eq!(buf1, buf2);
-            f1_reader.consume(len1);
-            f2_reader.consume(len2);
-        }
-        let metadata = dest.metadata()?;
-        if let Some(mode) = obj.target_permissions.target_mode {
-            assert_eq!(mode, metadata.mode() % 0o1000);
-        }
-        if let Some(uid) = obj.target_permissions.target_uid {
-            let uid = uid.as_uid_t();
-            assert_eq!(uid, metadata.uid() % 0o1000);
-        }
-        if let Some(gid) = obj.target_permissions.target_gid {
-            let gid = gid.as_gid_t();
-            assert_eq!(gid, metadata.gid() % 0o1000);
-        }
 
         loopdev.detach()?;
         Ok(())
     }
 
     #[test]
-    #[serial]
     #[ignore]
+    #[serial]
     fn copy_over_formated_partion() {
         fake_copy_object(|obj| obj.target_format.format = true, None).unwrap();
     }
@@ -268,8 +254,8 @@ mod tests {
             |_| (),
             Some(definitions::TargetPermissions {
                 target_mode: Some(0o666),
-                target_gid: Some(definitions::target_permissions::Id::Number(1000)),
-                target_uid: Some(definitions::target_permissions::Id::Number(1000)),
+                target_gid: Some(definitions::target_permissions::Gid::Number(1000)),
+                target_uid: Some(definitions::target_permissions::Uid::Number(1000)),
             }),
         )
         .unwrap();
@@ -282,7 +268,7 @@ mod tests {
         fake_copy_object(
             |obj| {
                 obj.target_permissions.target_uid =
-                    Some(definitions::target_permissions::Id::Number(0))
+                    Some(definitions::target_permissions::Uid::Number(0))
             },
             None,
         )
@@ -296,12 +282,12 @@ mod tests {
         fake_copy_object(
             |obj| {
                 obj.target_permissions.target_gid =
-                    Some(definitions::target_permissions::Id::Number(0))
+                    Some(definitions::target_permissions::Gid::Number(0))
             },
             Some(definitions::TargetPermissions {
                 target_mode: Some(0o666),
-                target_gid: Some(definitions::target_permissions::Id::Number(1000)),
-                target_uid: Some(definitions::target_permissions::Id::Number(1000)),
+                target_gid: Some(definitions::target_permissions::Gid::Number(1000)),
+                target_uid: Some(definitions::target_permissions::Uid::Number(1000)),
             }),
         )
         .unwrap();
@@ -315,8 +301,8 @@ mod tests {
             |obj| obj.target_permissions.target_mode = Some(0o444),
             Some(definitions::TargetPermissions {
                 target_mode: Some(0o666),
-                target_gid: Some(definitions::target_permissions::Id::Number(1000)),
-                target_uid: Some(definitions::target_permissions::Id::Number(1000)),
+                target_gid: Some(definitions::target_permissions::Gid::Number(1000)),
+                target_uid: Some(definitions::target_permissions::Uid::Number(1000)),
             }),
         )
         .unwrap();

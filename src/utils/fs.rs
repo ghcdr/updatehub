@@ -2,11 +2,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::update_package::object::definitions::{target_permissions::Id, Filesystem};
-// use easy_process;
-use failure::ensure;
-use nix::unistd::{Gid, Uid};
-use std::{io, path::Path, process::Command};
+use crate::update_package::object::definitions::{
+    target_permissions::{Gid, Uid},
+    Filesystem,
+};
+use easy_process;
+use std::{io, path::Path};
 use sys_mount::{Mount, Unmount, UnmountDrop};
 
 pub(crate) fn format(
@@ -29,19 +30,23 @@ pub(crate) fn format(
         }
     };
 
-    // let output = easy_process::run(&cmd.as_str())?;
-    let cmd: Vec<&str> = cmd.split(' ').filter(|s| !s.is_empty()).collect();
-    let output = Command::new(cmd[0]).args(&cmd[1..]).output()?;
-    ensure!(
-        output.status.success(),
-        format!("Format command failed with code: {:#?}", output)
-    );
-    // ensure!(
-    //     output.stderr.is_empty(),
-    //     format!("Format command filed: {:?}", output)
-    // );
-
+    easy_process::run(&cmd)?;
     Ok(())
+}
+
+pub(crate) fn mount_and_run<F>(
+    source: &Path,
+    fs: Filesystem,
+    options: &str,
+    f: F,
+) -> Result<(), failure::Error>
+where
+    F: FnOnce(&Path) -> Result<(), failure::Error>,
+{
+    let tmpdir = tempfile::tempdir()?;
+    let tmpdir = tmpdir.path();
+    let _guard = mount(source, &tmpdir, fs, options)?;
+    f(tmpdir)
 }
 
 pub(crate) fn mount(
@@ -71,10 +76,12 @@ pub(crate) fn chmod(path: &Path, mode: u32) -> Result<(), failure::Error> {
     Ok(())
 }
 
-pub(crate) fn chown(path: &Path, uid: &Option<Id>, gid: &Option<Id>) -> nix::Result<()> {
+pub(crate) fn chown(path: &Path, uid: &Option<Uid>, gid: &Option<Gid>) -> nix::Result<()> {
     nix::unistd::chown(
         path,
-        uid.as_ref().map(|id| Uid::from_raw(id.as_uid_t())),
-        gid.as_ref().map(|id| Gid::from_raw(id.as_gid_t())),
+        uid.as_ref()
+            .map(|id| nix::unistd::Uid::from_raw(id.as_u32())),
+        gid.as_ref()
+            .map(|id| nix::unistd::Gid::from_raw(id.as_u32())),
     )
 }

@@ -140,8 +140,9 @@ mod tests {
 
         // Setup faked device
         let (loopdev, device) = {
+            // Loop device next_free is not thread safe
             let mutex = SERIALIZE.clone();
-            let _guard = mutex.lock().unwrap();
+            let _mutex = mutex.lock().unwrap();
             let loopdev = loopdev::LoopControl::open()?.next_free()?;
             let device = loopdev.path().unwrap();
             loopdev.attach_file(image.path())?;

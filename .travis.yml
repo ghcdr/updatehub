@@ -28,7 +28,8 @@ script:
   - |
     cargo check --tests &&
     cargo build --tests &&
-    cargo test --include-ignored &&
+    cargo test &&
+    cargo test --ignored &&
     cargo doc &&
     cargo clippy --tests
 after_success:

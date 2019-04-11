@@ -63,6 +63,7 @@ macro_rules! for_any_object {
         match $mode {
             Object::Copy($alias) => $code,
             Object::Raw($alias) => $code,
+            Object::Flash($alias) => $code,
             #[cfg(test)]
             Object::Test($alias) => $code,
             _ => panic!("FIXME: TODO: Mode still not supported"),

@@ -10,7 +10,7 @@ license = "Apache-2.0"
 edition = "2018"
 
 [dependencies]
-actix = "0.8"
+actix = "0.9"
 actix-web = "1"
 chrono = { version = "0.4", features = ["serde"] }
 compress-tools = "0.1"

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use actix::Addr;
-use futures::future::Future;
 use slog_scope::{debug, error, info};
 use std::{sync::mpsc, thread};
 
@@ -55,23 +54,25 @@ impl Controller {
         self.terminate = Some(sndr);
 
         // We ignore errors raised by the stepper
-        let _ = thread::Builder::new().name(String::from("Actor Stepper")).spawn(move || {
-            while recv.try_recv().is_err() {
-                match addr.send(super::Step).wait() {
-                    Err(e) => {
-                        error!("Communication to actor failed: {:?}", e);
-                    }
-                    Ok(super::StepTransition::Immediate) => {}
-                    Ok(super::StepTransition::Delayed(t)) => {
-                        debug!("Sleeping stepper thread for: {} seconds", t.as_secs());
-                        std::thread::sleep(t);
-                    }
-                    Ok(super::StepTransition::Never) => {
-                        info!("Stopping step messages");
-                        break;
+        let _ = thread::Builder::new().name(String::from("Actor Stepper")).spawn(|| {
+            actix::Arbiter::spawn(async move {
+                while recv.try_recv().is_err() {
+                    match addr.send(super::Step).await {
+                        Err(e) => {
+                            error!("Communication to actor failed: {:?}", e);
+                        }
+                        Ok(super::StepTransition::Immediate) => {}
+                        Ok(super::StepTransition::Delayed(t)) => {
+                            debug!("Sleeping stepper thread for: {} seconds", t.as_secs());
+                            std::thread::sleep(t);
+                        }
+                        Ok(super::StepTransition::Never) => {
+                            info!("Stopping step messages");
+                            break;
+                        }
                     }
                 }
-            }
+            })
         });
     }
 }

@@ -12,8 +12,20 @@ pub(crate) mod probe;
 pub(crate) mod stepper;
 
 use super::{Idle, Metadata, Probe, RuntimeSettings, Settings, State, StateMachine};
-use actix::{Actor, Addr, Arbiter, AsyncContext, Context, Handler, Message, MessageResult};
+use actix::{Actor, Addr, Arbiter, AsyncContext, Context, Handler, Message, ResponseFuture};
 use slog_scope::info;
+use std::{cell::Cell, time::Duration};
+
+// Given the limitations to asynchronously handle messages on actix 0.9,
+// see: https://github.com/actix/actix/issues/308,
+// we have decied to use Cell for unsafe pointer access to the state machine.
+// Since the actor, by definition, won't handle multiple messages concurrently
+// or poll more than one future at a time, and since whenever the systems
+// polls the future the Actor is still alive, we belive this access is always
+// valid.
+pub(crate) struct MachineActor {
+    sm: std::cell::Cell<Machine>,
+}
 
 pub(crate) struct Machine {
     state: Option<StateMachine>,
@@ -36,7 +48,7 @@ impl SharedState {
     }
 }
 
-impl Actor for Machine {
+impl Actor for MachineActor {
     type Context = Context<Self>;
 
     fn started(&mut self, _: &mut Self::Context) {
@@ -48,53 +60,59 @@ impl Actor for Machine {
     }
 }
 
-impl Machine {
+impl MachineActor {
     pub(super) fn new(
         state: StateMachine,
         settings: Settings,
         runtime_settings: RuntimeSettings,
         firmware: Metadata,
     ) -> Self {
-        Machine {
-            state: Some(state),
-            shared_state: SharedState { settings, runtime_settings, firmware },
-            stepper: stepper::Controller::default(),
+        MachineActor {
+            sm: Cell::new(Machine {
+                state: Some(state),
+                shared_state: SharedState { settings, runtime_settings, firmware },
+                stepper: stepper::Controller::default(),
+            }),
         }
     }
 
     pub(super) fn start(mut self) -> Addr<Self> {
-        Machine::start_in_arbiter(&Arbiter::new(), move |ctx| {
-            self.stepper.start(ctx.address());
+        MachineActor::start_in_arbiter(&Arbiter::new(), move |ctx| {
+            self.sm.get_mut().stepper.start(ctx.address());
             self
         })
     }
 }
 
+#[derive(Message)]
+#[rtype(StepTransition)]
 struct Step;
 
 pub(crate) enum StepTransition {
-    Delayed(std::time::Duration),
+    Delayed(Duration),
     Immediate,
     Never,
 }
 
-impl Message for Step {
-    type Result = StepTransition;
-}
-
-impl Handler<Step> for Machine {
-    type Result = MessageResult<Step>;
+impl Handler<Step> for MachineActor {
+    type Result = ResponseFuture<StepTransition>;
 
     fn handle(&mut self, _: Step, _: &mut Context<Self>) -> Self::Result {
-        if let Some(machine) = self.state.take() {
-            let (state, transition) = machine
-                .move_to_next_state(&mut self.shared_state)
-                .unwrap_or_else(|e| (StateMachine::from(e), StepTransition::Immediate));
-            self.state = Some(state);
+        let sm = self.sm.as_ptr();
+        Box::pin(async move {
+            unsafe {
+                if let Some(machine) = (*sm).state.take() {
+                    let (state, transition) = machine
+                        .move_to_next_state(&mut (*sm).shared_state)
+                        .await
+                        .unwrap_or_else(|e| (StateMachine::from(e), StepTransition::Immediate));
+                    (*sm).state = Some(state);
 
-            return MessageResult(transition);
-        }
-
-        unreachable!("Failed to take StateMachine from StateAgent")
+                    transition
+                } else {
+                    unreachable!("Failed to take StateMachine from StateAgent")
+                }
+            }
+        })
     }
 }

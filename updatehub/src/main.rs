@@ -20,7 +20,7 @@ struct Opt {
     verbose: usize,
 }
 
-async fn run() -> Result<(), failure::Error> {
+async fn run() -> updatehub::Result<()> {
     let opt = Opt::from_args();
 
     updatehub::logger::init(opt.verbose);
@@ -36,7 +36,6 @@ async fn run() -> Result<(), failure::Error> {
 async fn main() {
     if let Err(ref e) = run().await {
         eprintln!("{}", e);
-        e.iter_causes().skip(1).for_each(|e| eprintln!(" caused by: {}\n", e));
 
         std::process::exit(1);
     }

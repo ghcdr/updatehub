@@ -24,6 +24,7 @@ impl API {
             .route("/info", web::get().to(API::info))
             .route("/log", web::get().to(API::log))
             .route("/probe", web::post().to(API::probe))
+            .route("/local_install", web::post().to(API::local_install))
             .route("/update/download/abort", web::post().to(API::download_abort));
     }
 
@@ -36,6 +37,14 @@ impl API {
         server_address: Option<String>,
     ) -> Result<actor::probe::Response> {
         Ok(agent.0.send(actor::probe::Request(server_address)).await?)
+    }
+
+    #[allow(unused_variables, unreachable_code)]
+    async fn local_install(
+        agent: web::Data<API>,
+        file_path: String,
+    ) -> Result<actor::local_install::Response> {
+        Ok(agent.0.send(actor::local_install::Request(std::path::PathBuf::from(file_path))).await?)
     }
 
     async fn log() -> HttpResponse {
@@ -85,6 +94,19 @@ impl Responder for actor::probe::Response {
                 HttpResponse::Ok().json(Payload { busy: true, state })
             }
         }
+    }
+}
+
+impl Responder for actor::local_install::Response {
+    type Error = actix_web::Error;
+    type Future = HttpResponse;
+
+    fn respond_to(self, _: &HttpRequest) -> Self::Future {
+        match self {
+            actor::local_install::Response::RequestAccepted => HttpResponse::Ok(),
+            actor::local_install::Response::InvalidState => HttpResponse::UnprocessableEntity(),
+        }
+        .finish()
     }
 }
 
